@@ -567,7 +567,11 @@ function aCard(a){
   return el;
 }
 
-/* ── ANIME MODAL — carga episodios reales de HiAnime ── */
+/* ── ANIME MODAL
+   Muestra episodios de Jikan INMEDIATAMENTE (< 2s)
+   Luego intenta obtener IDs reales de HiAnime en segundo plano
+   y actualiza los botones sin bloquear la UI
+─────────────────────────────────────────────── */
 async function openAnimeModal(a){
   const img=a.images?.jpg?.large_image_url||a.images?.jpg?.image_url||APH;
   const title=a.title_spanish||a.title_english||a.title||'Sin título';
@@ -576,119 +580,147 @@ async function openAnimeModal(a){
   $('amImg').src=img;
   $('amT').textContent=title;
   $('amScore').textContent=a.score?`⭐ ${a.score} · ${a.type||''} · ${a.episodes||'?'} eps`:'';
-  $('amSub').textContent='Conectando con HiAnime...';
+  $('amSub').textContent='Cargando episodios...';
   $('amApi').className='amh-api loading';
-  $('amApi').textContent='⏳ Buscando episodios reales...';
+  $('amApi').textContent='⏳ Buscando en HiAnime...';
   $('am').classList.add('open');
-  $('epl').innerHTML='<div class="empty">⏳ Conectando con HiAnime...</div>';
+  $('epl').innerHTML='<div class="empty">⏳ Un momento...</div>';
 
-  // PASO 1: Buscar en HiAnime para obtener hiId
+  // PASO 1: Cargar episodios de Jikan INMEDIATAMENTE (sin esperar HiAnime)
+  const jikanEps=await loadEpisodesFromJikanFast(a,title);
+
+  // PASO 2: En paralelo, buscar HiAnime para obtener IDs reales
+  // Si la API responde, actualiza los episodios ya mostrados
+  upgradeWithHiAnime(a,title,engTitle,jikanEps).catch(()=>{});
+}
+
+// Carga y muestra episodios desde Jikan inmediatamente
+async function loadEpisodesFromJikanFast(a,title){
+  let eps=[];
+  try{
+    const ac=new AbortController();
+    setTimeout(()=>ac.abort(),5000);
+    const r=await fetch(`https://api.jikan.moe/v4/anime/${a.mal_id}/episodes`,{signal:ac.signal});
+    eps=(await r.json()).data||[];
+  }catch{}
+
+  const total=Math.min(a.episodes||12,500);
+  if(!eps.length) eps=Array.from({length:total},(_,i)=>({mal_id:i+1,title:null,filler:false}));
+
+  $('amSub').textContent=`${eps.length} episodios`;
+  renderEpisodes(eps,a.mal_id,title,null); // null = sin IDs de HiAnime aún
+  return eps;
+}
+
+// Intenta obtener IDs reales de HiAnime y actualiza la lista existente
+async function upgradeWithHiAnime(a,title,engTitle,jikanEps){
+  const searchTitles=[engTitle,title,a.title].filter((t,i,arr)=>t&&arr.indexOf(t)===i);
+
+  // Timeout corto para no bloquear — si no responde en 8s, no pasa nada
   let hiId=null;
-  const searchTitles=[title,engTitle,a.title].filter(Boolean);
-  
   for(const q of searchTitles){
-    const results=await hiSearch(q);
-    if(results.length){
-      hiId=results[0].id;
-      break;
-    }
+    try{
+      const ac=new AbortController();
+      setTimeout(()=>ac.abort(),7000);
+      const r=await fetch(
+        `https://aniwatch-api-dusky.vercel.app/api/v2/hianime/search?q=${encodeURIComponent(q)}&page=1`,
+        {signal:ac.signal}
+      );
+      const d=await r.json();
+      const animes=d?.data?.animes||[];
+      if(animes.length){hiId=animes[0].id;break;}
+    }catch{}
   }
 
   if(!hiId){
-    // API no disponible — usar MAL ID con megaplay como fallback
     $('amApi').className='amh-api api-err';
-    $('amApi').textContent='⚠ API no disponible — usando fallback';
-    loadEpisodesFromJikan(a,title);
+    $('amApi').textContent='⚠ HiAnime API no disponible — modo básico';
     return;
   }
+
+  // Obtener episodios de HiAnime
+  let hiEps=[];
+  try{
+    const ac=new AbortController();
+    setTimeout(()=>ac.abort(),8000);
+    const r=await fetch(
+      `https://aniwatch-api-dusky.vercel.app/api/v2/hianime/anime/${hiId}/episodes`,
+      {signal:ac.signal}
+    );
+    const d=await r.json();
+    hiEps=d?.data?.episodes||[];
+  }catch{}
+
+  if(!hiEps.length){
+    $('amApi').className='amh-api api-err';
+    $('amApi').textContent='⚠ Sin episodios en HiAnime API';
+    return;
+  }
+
+  // Construir mapa: número de episodio → hiEpNum real
+  const hiMap={};
+  hiEps.forEach(ep=>{
+    const num=extractHiEpNum(ep.episodeId);
+    if(num) hiMap[ep.number]=num;
+  });
 
   $('amApi').className='amh-api api-ok';
-  $('amApi').textContent=`✓ Conectado a HiAnime · ${hiId}`;
+  $('amApi').textContent=`✓ HiAnime conectado · ${Object.keys(hiMap).length} IDs obtenidos`;
+  $('amSub').textContent=`${hiEps.length} episodios — HiAnime`;
 
-  // PASO 2: Obtener lista de episodios con IDs reales
-  const episodes=await hiEpisodes(hiId);
+  // Re-renderizar con IDs reales
+  renderEpisodes(jikanEps.length?jikanEps:hiEps.map(e=>({mal_id:e.number,title:e.title,filler:e.isFiller})),
+    a.mal_id, title, hiMap);
+}
 
-  if(!episodes.length){
-    // Fallback: generar desde Jikan
-    $('amApi').textContent='⚠ Usando datos de MyAnimeList';
-    loadEpisodesFromJikan(a,title);
-    return;
-  }
-
-  $('amSub').textContent=`${episodes.length} episodios — HiAnime`;
+// Renderiza la lista de episodios (con o sin hiMap)
+function renderEpisodes(eps,malId,title,hiMap){
   $('epl').innerHTML='';
+  eps.forEach(ep=>{
+    const num=ep.mal_id||ep.number;
+    const epTitle=ep.title||`Episodio ${num}`;
+    const hiEpNum=hiMap?hiMap[num]:null;
 
-  episodes.forEach(ep=>{
-    const hiEpNum=extractHiEpNum(ep.episodeId);
-    const epTitle=ep.title||`Episodio ${ep.number}`;
     const div=document.createElement('div');
     div.className='epi';
-
     div.innerHTML=`
-      <div class="ep-n">${ep.number}</div>
+      <div class="ep-n">${num}</div>
       <div class="ep-info">
         <div class="ep-t">${esc(epTitle)}</div>
         <div class="ep-meta">
-          ${ep.isFiller?`<span class="ep-filler">⚠ Relleno</span>`:''}
-          ${hiEpNum?`<span style="color:#7070a0">ID: ${hiEpNum}</span>`:''}
+          ${ep.filler||ep.isFiller?'<span class="ep-filler">⚠ Relleno</span>':''}
+          ${hiEpNum?`<span style="color:#00e676;font-size:9px">✓ HiAnime</span>`:hiMap?'':''}
         </div>
       </div>
       <div class="ep-play">▶️</div>`;
 
     div.addEventListener('click',()=>{
-      if(!hiEpNum){showAnimeFallback(title);return;}
-      curCtx={malId:a.mal_id,hiId,hiEpNum,lang:'sub',title:`${title} Ep.${ep.number}`};
-      openPlayer('🌸 '+title+' Ep.'+ep.number);
+      const label=`${title} Ep.${num}`;
+      curCtx={malId,hiEpNum,lang:'sub',title:label};
+      openPlayer('🌸 '+label);
       $('langBar').style.display='flex';
       $('lSub').classList.add('on');$('lDub').classList.remove('on');
       $('am').classList.remove('open');
-      playWithHiId(hiEpNum,`${title} Ep.${ep.number}`,'sub');
-    });
-    $('epl').appendChild(div);
-  });
-}
 
-/* Fallback: cargar episodios desde Jikan (sin IDs reales de HiAnime) */
-async function loadEpisodesFromJikan(a,title){
-  let eps=[];
-  try{
-    const r=await fetch(`https://api.jikan.moe/v4/anime/${a.mal_id}/episodes`);
-    eps=(await r.json()).data||[];
-  }catch{}
-  
-  const total=a.episodes||12;
-  if(!eps.length)eps=Array.from({length:Math.min(total,300)},(_,i)=>({mal_id:i+1,title:null,filler:false}));
-  
-  $('amSub').textContent=`${eps.length} episodios (MyAnimeList)`;
-  $('epl').innerHTML='';
-  eps.forEach(ep=>{
-    const div=document.createElement('div');
-    div.className='epi';
-    div.innerHTML=`
-      <div class="ep-n">${ep.mal_id}</div>
-      <div class="ep-info">
-        <div class="ep-t">${esc(ep.title||'Episodio '+ep.mal_id)}</div>
-        <div class="ep-meta">${ep.filler?'<span class="ep-filler">⚠ Relleno</span>':''}</div>
-      </div>
-      <div class="ep-play">▶️</div>`;
-    // Sin ID real → usar MAL ID fallback (megaplay MAL endpoint)
-    div.addEventListener('click',()=>{
-      const epLabel=`${title} Ep.${ep.mal_id}`;
-      curCtx={malId:a.mal_id,hiEpNum:null,lang:'sub',title:epLabel};
-      openPlayer('🌸 '+epLabel);
-      $('langBar').style.display='flex';
-      $('am').classList.remove('open');
-      // Intentar con MAL ID (puede dar 410 si no está mapeado)
-      const url=`https://megaplay.buzz/stream/mal/${a.mal_id}/${ep.mal_id}/sub`;
-      $('pbody').innerHTML='';
-      const iframe=document.createElement('iframe');
-      iframe.src=url;iframe.frameBorder='0';iframe.allowFullscreen=true;
-      iframe.allow='autoplay; fullscreen; encrypted-media';
-      iframe.style.cssText='width:100%;height:100%';
-      $('pbody').appendChild(iframe);
-      setTimeout(()=>{
-        if($('pbody').querySelector('iframe')){}// still loading is ok
-      },16000);
+      if(hiEpNum){
+        // Tiene ID real de HiAnime → megaplay funciona siempre
+        playWithHiId(hiEpNum,label,'sub');
+      } else {
+        // Sin ID real → intentar con MAL ID (puede funcionar para animes populares)
+        const url=`https://megaplay.buzz/stream/mal/${malId}/${num}/sub`;
+        $('pbody').innerHTML='';
+        const spin=document.createElement('div');
+        spin.style.cssText='position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:#000;z-index:3';
+        spin.innerHTML='<div style="font-size:36px;animation:pulse 1.5s infinite">🌸</div><div style="font-size:11px;color:#7070a0">Cargando...</div>';
+        $('pbody').appendChild(spin);
+        const iframe=document.createElement('iframe');
+        iframe.src=url;iframe.frameBorder='0';iframe.allowFullscreen=true;
+        iframe.allow='autoplay; fullscreen; encrypted-media';
+        iframe.style.cssText='width:100%;height:100%;position:absolute;inset:0;opacity:0;transition:opacity .3s;z-index:2';
+        iframe.addEventListener('load',()=>{spin.remove();iframe.style.opacity='1';});
+        $('pbody').appendChild(iframe);
+        setTimeout(()=>{if(document.body.contains(spin))showAnimeFallback(label);},14000);
+      }
     });
     $('epl').appendChild(div);
   });
